@@ -7,9 +7,9 @@ Expose deux modes : séquentiel et parallèle (multiprocessing.Pool).
 
 import os
 import time
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, Value, cpu_count
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from image_processor import FilterType, ProcessingResult, TaskPayload, process_image
 
@@ -22,7 +22,7 @@ SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
 
 def collect_images(input_dir: str) -> List[str]:
-    """Retourne tous les chemins d'images supportées dans input_dir (récursif optionnel)."""
+    """Retourne tous les chemins d'images supportées dans input_dir."""
     paths = []
     for entry in sorted(Path(input_dir).iterdir()):
         if entry.is_file() and entry.suffix.lower() in SUPPORTED_EXTENSIONS:
@@ -55,13 +55,23 @@ def build_tasks(
 #  Modes d'exécution
 # ─────────────────────────────────────────────
 
-def run_sequential(tasks: List[TaskPayload]) -> Tuple[List[ProcessingResult], float]:
+def run_sequential(
+    tasks: List[TaskPayload],
+    *,
+    progress_value: Optional[Value] = None
+) -> Tuple[List[ProcessingResult], float]:
     """
     Traitement séquentiel — baseline de comparaison.
-    Exécute process_image() dans le processus principal, une image à la fois.
+    Incrémente progress_value (si fourni) après chaque image traitée.
     """
     t0 = time.perf_counter()
-    results = [process_image(task) for task in tasks]
+    results = []
+    for task in tasks:
+        res = process_image(task)
+        results.append(res)
+        if progress_value is not None:
+            with progress_value.get_lock():
+                progress_value.value += 1
     elapsed = time.perf_counter() - t0
     return results, elapsed
 
@@ -70,28 +80,29 @@ def run_parallel(
     tasks: List[TaskPayload],
     num_workers: int,
     chunk_size: int = None,
+    *,
+    progress_value: Optional[Value] = None,
 ) -> Tuple[List[ProcessingResult], float]:
     """
     Traitement parallèle avec multiprocessing.Pool.
 
-    Pool.map() distribue les tâches sur num_workers processus OS.
-    chunk_size contrôle combien de tâches sont envoyées par batch à chaque worker.
-    Si None → calculé automatiquement (heuristique Python).
-
-    Pourquoi Pool et pas ThreadPool ?
-    → Le GIL bloque les threads pour du calcul CPU intensif (OpenCV/numpy).
-    → Pool fork de vrais sous-processus → pas de GIL → vrai parallélisme.
+    progress_value : si fourni, sera incrémenté atomiquement
+    à chaque image terminée. (keyword-only pour éviter toute confusion avec chunk_size).
     """
-    # Clamp sur les CPU disponibles pour éviter l'over-subscription
     effective_workers = min(num_workers, cpu_count())
 
-    # chunk_size heuristique : évite trop de round-trips IPC
     if chunk_size is None:
         chunk_size = max(1, len(tasks) // (effective_workers * 4))
 
     t0 = time.perf_counter()
     with Pool(processes=effective_workers) as pool:
-        results = pool.map(process_image, tasks, chunksize=chunk_size)
+        # imap_unordered permet d'incrémenter la progression au fil de l'eau
+        results = []
+        for res in pool.imap_unordered(process_image, tasks, chunksize=chunk_size):
+            results.append(res)
+            if progress_value is not None:
+                with progress_value.get_lock():
+                    progress_value.value += 1
     elapsed = time.perf_counter() - t0
 
     return results, elapsed
